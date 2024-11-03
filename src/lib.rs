@@ -19,10 +19,10 @@ use fugit::{ExtU32, HertzU32, MicrosDurationU32};
 use rp2040_hal::{
     dma::{
         single_buffer::{self, Config, Transfer},
-        Channel, ChannelIndex,
+        Channel, ChannelIndex, Pace,
     },
     gpio::AnyPin,
-    pio::{PIOExt, StateMachineIndex, Tx, UninitStateMachine, PIO},
+    pio::{InstallError, InstalledProgram, PIOExt, StateMachineIndex, Tx, UninitStateMachine, PIO},
 };
 use smart_leds_trait::SmartLedsWrite;
 
@@ -69,7 +69,6 @@ where
     transfer: Option<Transfer<Channel<C>, &'static mut [u32], Tx<(P, SM)>>>,
 }
 
-pub static mut LED_BUFFER: [u32; 320] = [0; 320];
 impl<P, SM, I, C> Ws2812Direct<P, SM, I, C>
 where
     I: AnyPin<Function = P::PinFunction>,
@@ -78,42 +77,20 @@ where
     C: ChannelIndex,
 {
     /// Creates a new instance of this driver.
+    #[inline(never)]
     pub fn new(
         pin: I,
-        pio: &mut PIO<P>,
+        installed: InstalledProgram<P>,
         sm: UninitStateMachine<(P, SM)>,
         clock_freq: fugit::HertzU32,
         dma: Channel<C>,
         buffer: &'static mut [u32],
     ) -> Self {
-        // prepare the PIO program
-        let side_set = pio::SideSet::new(false, 1, false);
-        let mut a = pio::Assembler::new_with_side_set(side_set);
-
         const T1: u8 = 2; // start bit
         const T2: u8 = 5; // data bit
         const T3: u8 = 3; // stop bit
         const CYCLES_PER_BIT: u32 = (T1 + T2 + T3) as u32;
         const FREQ: HertzU32 = HertzU32::kHz(800);
-
-        let mut wrap_target = a.label();
-        let mut wrap_source = a.label();
-        let mut do_zero = a.label();
-        a.bind(&mut wrap_target);
-        // Do stop bit
-        a.out_with_delay_and_side_set(pio::OutDestination::X, 1, T3 - 1, 0);
-        // Do start bit
-        a.jmp_with_delay_and_side_set(pio::JmpCondition::XIsZero, &mut do_zero, T1 - 1, 1);
-        // Do data bit = 1
-        a.jmp_with_delay_and_side_set(pio::JmpCondition::Always, &mut wrap_target, T2 - 1, 1);
-        a.bind(&mut do_zero);
-        // Do data bit = 0
-        a.nop_with_delay_and_side_set(T2 - 1, 0);
-        a.bind(&mut wrap_source);
-        let program = a.assemble_with_wrap(wrap_source, wrap_target);
-
-        // Install the program into PIO instruction memory.
-        let installed = pio.install(&program).unwrap();
 
         // Configure the PIO state machine.
         let bit_freq = FREQ * CYCLES_PER_BIT;
@@ -152,13 +129,45 @@ where
 
         sm.start();
 
-        let tx_buf = single_buffer::Config::new(dma, buffer, tx);
+        let mut tx_buf = single_buffer::Config::new(dma, buffer, tx);
+        tx_buf.pace(Pace::PreferSink);
         let transfer = Some(tx_buf.start());
         Self {
             _pin: I::from(pin),
             transfer,
         }
     }
+}
+pub fn load_program<P>(pio: &mut PIO<P>) -> Result<InstalledProgram<P>, InstallError>
+where
+    P: PIOExt,
+{
+    // prepare the PIO program
+    let side_set = pio::SideSet::new(false, 1, false);
+    let mut a = pio::Assembler::new_with_side_set(side_set);
+
+    const T1: u8 = 2; // start bit
+    const T2: u8 = 5; // data bit
+    const T3: u8 = 3; // stop bit
+    let mut wrap_target = a.label();
+    let mut wrap_source = a.label();
+    let mut do_zero = a.label();
+    a.bind(&mut wrap_target);
+    // Do stop bit
+    a.out_with_delay_and_side_set(pio::OutDestination::X, 1, T3 - 1, 0);
+    // Do start bit
+    a.jmp_with_delay_and_side_set(pio::JmpCondition::XIsZero, &mut do_zero, T1 - 1, 1);
+    // Do data bit = 1
+    a.jmp_with_delay_and_side_set(pio::JmpCondition::Always, &mut wrap_target, T2 - 1, 1);
+    a.bind(&mut do_zero);
+    // Do data bit = 0
+    a.nop_with_delay_and_side_set(T2 - 1, 0);
+    a.bind(&mut wrap_source);
+    let program = a.assemble_with_wrap(wrap_source, wrap_target);
+
+    // Install the program into PIO instruction memory.
+
+    pio.install(&program)
 }
 
 impl<P, SM, I, C> SmartLedsWrite for Ws2812Direct<P, SM, I, C>
@@ -177,9 +186,10 @@ where
     ///
     /// Please bear in mind, that it still blocks when writing into the
     /// PIO FIFO until all data has been transmitted to the LED chain.
+    #[inline(never)]
     fn write<T, J>(&mut self, iterator: T) -> Result<(), ()>
     where
-        T: Iterator<Item = J>,
+        T: IntoIterator<Item = J>,
         J: Into<Self::Color>,
     {
         if self.transfer.is_some() {
@@ -192,17 +202,23 @@ where
             let (ch, buffer, tx) = transfer.wait();
             //transfer is done
             //
-            *buffer = [0; 320];
+            for x in buffer.iter_mut() {
+                *x = 0u32;
+            }
 
-            for (index, item) in iterator.enumerate().take(320) {
+            for (index, item) in iterator.into_iter().enumerate() {
                 let color: Self::Color = item.into();
                 let word = (u32::from(color.g) << 24)
                     | (u32::from(color.r) << 16)
                     | (u32::from(color.b) << 8);
-                buffer[index] = word;
+                if let Some(buf) = buffer.get_mut(index) {
+                    *buf = word
+                }
             }
-            let new_transfer = single_buffer::Config::new(ch, buffer, tx).start();
-            self.transfer = Some(new_transfer);
+            let mut new_transfer = single_buffer::Config::new(ch, buffer, tx);
+            new_transfer.pace(Pace::PreferSink);
+            let transfer = new_transfer.start();
+            self.transfer = Some(transfer);
         }
 
         // Prepare LED data for the transfer
